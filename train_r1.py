@@ -464,8 +464,8 @@ def main():
 
     policy_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
         device_map=0,
     )
 
@@ -483,19 +483,19 @@ def main():
 
     reference_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
+        attn_implementation="flash_attention_2",
+        torch_dtype=torch.bfloat16,
         device_map=0,
     )
 
     # params_to_train = filter(lambda p: p.requires_grad, policy_model.parameters())
 
 
-    optimizer = bnb.optim.PagedAdamW8bit(
-            policy_model.parameters(),
-            lr=1e-4,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
+    optimizer = torch.optim.AdamW(
+        policy_model.parameters(),
+        lr=1e-4,
+        betas=(0.9, 0.999),
+        weight_decay=0.01
     )
 
     # policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -524,7 +524,7 @@ def main():
         enable_prefix_caching=True,
         swap_space=1,
         scheduling_policy="fcfs",
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         max_model_len=2048,
         enable_sleep_mode=True,
     )
@@ -698,6 +698,7 @@ def main():
             print(loss.requires_grad)
 
             total_loss = loss + (total_loss if isinstance(total_loss, torch.Tensor) else 0)
+
             print("Total Loss")
             print(total_loss)
             print(total_loss.requires_grad)
