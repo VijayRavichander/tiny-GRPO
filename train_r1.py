@@ -340,7 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train R1 model with PPO")
     parser.add_argument("--kl_coeff", type=float, default=0.001, help="KL coefficient for PPO")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model name/path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B", help="Model name/path")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for training")
     args = parser.parse_args()
 
@@ -363,21 +363,21 @@ def main():
     # Total number of training iterations
     NUM_ITERATIONS = 1000
     # Number of episodes to collect per iteration for training
-    EPISODES_PER_ITERATION = 64
+    EPISODES_PER_ITERATION = 16
     # Number of responses to generate for each input prompt
-    GENERATIONS_PER_SAMPLE = 2
+    GENERATIONS_PER_SAMPLE = 4
     # Controls how much the policy can deviate from the reference model
     KL_COEFFICIENT = args.kl_coeff
 
     # Training hyperparameters
     # Batch size for each GPU device during training
-    PER_DEVICE_BATCH_SIZE = 2
+    PER_DEVICE_BATCH_SIZE = 4
     # Learning rate for model updates
     LEARNING_RATE = 1e-6
 
     # Sampling parameters
     # Maximum number of tokens to generate in each response
-    MAX_RESPONSE_TOKENS = 10
+    MAX_RESPONSE_TOKENS = 512
     # Controls randomness in generation (higher = more random)
     TEMPERATURE = args.temperature
     # Nucleus sampling parameter (1.0 = disabled)
@@ -470,16 +470,16 @@ def main():
     )
 
 
-    lora_config = LoraConfig(
-        r=8,  # Rank of the update matrices
-        lora_alpha=32,  # Scaling factor
-        target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA to
-        lora_dropout=0.05,  # Dropout probability for LoRA layers
-        bias="none",  # Bias type
-        task_type=TaskType.CAUSAL_LM  # Task type
-    )   
+    # lora_config = LoraConfig(
+    #     r=8,  # Rank of the update matrices
+    #     lora_alpha=32,  # Scaling factor
+    #     target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA to
+    #     lora_dropout=0.05,  # Dropout probability for LoRA layers
+    #     bias="none",  # Bias type
+    #     task_type=TaskType.CAUSAL_LM  # Task type
+    # )   
 
-    policy_model = get_peft_model(policy_model, lora_config)
+    # policy_model = get_peft_model(policy_model, lora_config)
 
     reference_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -488,12 +488,11 @@ def main():
         device_map=0,
     )
 
-    params_to_train = filter(lambda p: p.requires_grad, policy_model.parameters())
+    # params_to_train = filter(lambda p: p.requires_grad, policy_model.parameters())
 
-    print(params_to_train)
 
     optimizer = bnb.optim.PagedAdamW8bit(
-            params_to_train,
+            policy_model.parameters(),
             lr=1e-4,
             betas=(0.9, 0.999),
             weight_decay=0.01
@@ -521,7 +520,7 @@ def main():
     inference_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
-        gpu_memory_utilization=0.25,
+        gpu_memory_utilization=0.5,
         enable_prefix_caching=True,
         swap_space=1,
         scheduling_policy="fcfs",
@@ -693,6 +692,7 @@ def main():
                 TEMPERATURE=TEMPERATURE,
                 KL_COEFFICIENT=KL_COEFFICIENT,
             )   
+            
             print("Loss")
             print(loss)
             print(loss.requires_grad)
@@ -740,8 +740,7 @@ def main():
         time.sleep(1)
 
         inference_engine.wake_up()
-        merged_model = policy_model.merge_and_unload()
-        load_model_into_vllm(merged_model, inference_engine)
+        load_model_into_vllm(policy_model, inference_engine)
 
 
     #     #########################################################
