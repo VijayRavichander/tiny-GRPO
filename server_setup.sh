@@ -17,8 +17,8 @@ echo "Setup complete! Python environment is ready."
 # uv venv
 # source .venv/bin/activate
 # export HF_HUB_ENABLE_HF_TRANSFER=1
-
-# uv pip install transformers torch tqdm datasets dotenv hf-transfer wandb
+# export VLLM_ENABLE_V1_MULTIPROCESSING=0
+# uv pip install transformers torch tqdm datasets dotenv hf-transfer wandb vllm peft bitsandbytes
 
 # sudo apt-get update
 # sudo apt-get install -y python3-dev build-essential

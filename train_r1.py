@@ -16,8 +16,10 @@ import torch
 from datasets import load_dataset
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
-from vllm import LLM, SamplingParams
+from peft import LoraConfig, get_peft_model, TaskType
 
+from vllm import LLM, SamplingParams
+import bitsandbytes as bnb
 import wandb
 from utils import (
     compute_token_log_probs,
@@ -338,7 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train R1 model with PPO")
     parser.add_argument("--kl_coeff", type=float, default=0.001, help="KL coefficient for PPO")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling")
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B", help="Model name/path")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model name/path")
     parser.add_argument("--learning_rate", type=float, default=1e-6, help="Learning rate for training")
     args = parser.parse_args()
 
@@ -363,19 +365,19 @@ def main():
     # Number of episodes to collect per iteration for training
     EPISODES_PER_ITERATION = 64
     # Number of responses to generate for each input prompt
-    GENERATIONS_PER_SAMPLE = 4
+    GENERATIONS_PER_SAMPLE = 2
     # Controls how much the policy can deviate from the reference model
     KL_COEFFICIENT = args.kl_coeff
 
     # Training hyperparameters
     # Batch size for each GPU device during training
-    PER_DEVICE_BATCH_SIZE = 4
+    PER_DEVICE_BATCH_SIZE = 2
     # Learning rate for model updates
     LEARNING_RATE = 1e-6
 
     # Sampling parameters
     # Maximum number of tokens to generate in each response
-    MAX_RESPONSE_TOKENS = 1024
+    MAX_RESPONSE_TOKENS = 10
     # Controls randomness in generation (higher = more random)
     TEMPERATURE = args.temperature
     # Nucleus sampling parameter (1.0 = disabled)
@@ -436,6 +438,8 @@ def main():
     EOS_TOKEN = tokenizer.convert_ids_to_tokens(EOS_TOKEN_ID)
 
     dataset = load_dataset("Jiayi-Pan/Countdown-Tasks-3to4", split="train")
+
+
     dataset = dataset.map(
         preprocess_example,
         num_proc=6,
@@ -460,84 +464,109 @@ def main():
 
     policy_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
         device_map=0,
     )
+
+
+    lora_config = LoraConfig(
+        r=8,  # Rank of the update matrices
+        lora_alpha=32,  # Scaling factor
+        target_modules=["q_proj", "v_proj"],  # Modules to apply LoRA to
+        lora_dropout=0.05,  # Dropout probability for LoRA layers
+        bias="none",  # Bias type
+        task_type=TaskType.CAUSAL_LM  # Task type
+    )   
+
+    policy_model = get_peft_model(policy_model, lora_config)
+
     reference_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+        torch_dtype=torch.float16,
         device_map=0,
     )
-    policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    # Initialize DeepSpeed engines
-    policy_model, *_ = deepspeed.initialize(
-        model=policy_model,
-        config=deepspeed_config,
-        model_parameters=policy_model.parameters(),
+    params_to_train = filter(lambda p: p.requires_grad, policy_model.parameters())
+
+    print(params_to_train)
+
+    optimizer = bnb.optim.PagedAdamW8bit(
+            params_to_train,
+            lr=1e-4,
+            betas=(0.9, 0.999),
+            weight_decay=0.01
     )
-    reference_model, *_ = deepspeed.initialize(
-        model=reference_model,
-        config=ref_deepspeed_config,
-    )
 
-    reference_model.module.cpu()
+    # policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    ############################################
-    # Initialize vLLM (Inference) engine
-    ############################################
+    # # Initialize DeepSpeed engines
+    # policy_model, *_ = deepspeed.initialize(
+    #     model=policy_model,
+    #     config=deepspeed_config,
+    #     model_parameters=policy_model.parameters(),
+    # )
+    # reference_model, *_ = deepspeed.initialize(
+    #     model=reference_model,
+    #     config=ref_deepspeed_config,
+    # )
+
+    # reference_model.module.cpu()
+
+    # ############################################
+    # # Initialize vLLM (Inference) engine
+    # ############################################
 
     inference_engine = LLM(
         model=MODEL_NAME,
         skip_tokenizer_init=False,
-        gpu_memory_utilization=0.2,
+        gpu_memory_utilization=0.25,
         enable_prefix_caching=True,
         swap_space=1,
         scheduling_policy="fcfs",
-        dtype=torch.bfloat16,
+        dtype=torch.float16,
         max_model_len=2048,
         enable_sleep_mode=True,
     )
 
-    # Wandb for logging
-    wandb.init(
-        project="r1-aha-moment",
-        name=RUN_NAME,
-        config={
-            "model_name": MODEL_NAME,
-            "learning_rate": LEARNING_RATE,
-            "num_iterations": NUM_ITERATIONS,
-            "episodes_per_iteration": EPISODES_PER_ITERATION,
-            "rollouts_per_episode": GENERATIONS_PER_SAMPLE,
-            "kl_coefficient": KL_COEFFICIENT,
-            "temperature": TEMPERATURE,
-        },
-    )
+    # # Wandb for logging
+    # wandb.init(
+    #     project="r1-aha-moment",
+    #     name=RUN_NAME,
+    #     config={
+    #         "model_name": MODEL_NAME,
+    #         "learning_rate": LEARNING_RATE,
+    #         "num_iterations": NUM_ITERATIONS,
+    #         "episodes_per_iteration": EPISODES_PER_ITERATION,
+    #         "rollouts_per_episode": GENERATIONS_PER_SAMPLE,
+    #         "kl_coefficient": KL_COEFFICIENT,
+    #         "temperature": TEMPERATURE,
+    #     },
+    # )
 
-    # Load checkpoint if it exists
+    # # Load checkpoint if it exists
     begin_iter = 0
-    ckpt_path, ckpt_iter = find_last_checkpoint(EXP_DIR)
-    if ckpt_path is not None:
-        print(f"Resuming from checkpoint {ckpt_path} at iteration {ckpt_iter}")
-        out = policy_model.load_checkpoint(ckpt_path / "deepspeed")
-        if out is None:
-            raise RuntimeError(f"Failed to load checkpoint {ckpt_path}")
-        begin_iter = ckpt_iter + 1
-        load_model_into_vllm(policy_model, inference_engine)
+    # ckpt_path, ckpt_iter = find_last_checkpoint(EXP_DIR)
+    # if ckpt_path is not None:
+    #     print(f"Resuming from checkpoint {ckpt_path} at iteration {ckpt_iter}")
+    #     out = policy_model.load_checkpoint(ckpt_path / "deepspeed")
+    #     if out is None:
+    #         raise RuntimeError(f"Failed to load checkpoint {ckpt_path}")
+    #     begin_iter = ckpt_iter + 1
+    #     load_model_into_vllm(policy_model, inference_engine)
 
     for iteration in trange(begin_iter, NUM_ITERATIONS):
         print(f"Iteration {iteration}/{NUM_ITERATIONS}")
 
         metrics = {}
 
-        #########################################################
-        # Evaluation
-        #########################################################
+    #     #########################################################
+    #     # Evaluation
+    #     #########################################################
 
         eval_stats = None
-        if iteration % 25 == 0:
+        if iteration % 25 == 0 and iteration > 1:
             print("Evaluating on eval set...")
             eval_episodes, eval_stats = evaluate_on_test_set(
                 inference_engine=inference_engine,
@@ -553,15 +582,18 @@ def main():
                 ),
                 reward_func=lambda completion, sample: compute_reward(completion, sample, EOS_TOKEN),
             )
-            eval_episode_table = dump_episodes(
-                episodes=eval_episodes,
-                episodes_stats=eval_stats,
-                exp_dir=EXP_DIR,
-                tokenizer=tokenizer,
-                iteration=iteration,
-                is_eval=True,
-            )
-            wandb.log({"eval/episodes": eval_episode_table, "iteration": iteration})
+
+            print(eval_stats)
+
+    #         eval_episode_table = dump_episodes(
+    #             episodes=eval_episodes,
+    #             episodes_stats=eval_stats,
+    #             exp_dir=EXP_DIR,
+    #             tokenizer=tokenizer,
+    #             iteration=iteration,
+    #             is_eval=True,
+    #         )
+    #         wandb.log({"eval/episodes": eval_episode_table, "iteration": iteration})
 
         #########################################################
         # Generate Episodes
@@ -587,6 +619,9 @@ def main():
                 stop_token_ids=[EOS_TOKEN_ID],
             ),
         )
+
+        print(f"Generated Tokens: {outputs[0].outputs[0].token_ids}")
+
         all_generations = [list(g.token_ids) for out in outputs for g in out.outputs]
         all_finish_reasons = [g.finish_reason for out in outputs for g in out.outputs]
         inference_engine.sleep(1)
@@ -611,17 +646,17 @@ def main():
         for k, v in episodes_stats.items():
             metrics.setdefault(k, []).extend(v)
 
-        episode_table = dump_episodes(
-            episodes=episodes,
-            episodes_stats=episodes_stats,
-            exp_dir=EXP_DIR,
-            tokenizer=tokenizer,
-            iteration=iteration,
-        )
+        # episode_table = dump_episodes(
+        #     episodes=episodes,
+        #     episodes_stats=episodes_stats,
+        #     exp_dir=EXP_DIR,
+        #     tokenizer=tokenizer,
+        #     iteration=iteration,
+        # )
 
-        #########################################################
-        # Training
-        #########################################################
+    #     #########################################################
+    #     # Training
+    #     #########################################################
 
         # Prepare training batch
         model_inputs = prepare_model_inputs(
@@ -633,12 +668,13 @@ def main():
 
         # Calculate losses and update model
         policy_model.train()
-        reference_model.module.cuda()
+        reference_model.cuda()
         reference_model.eval()
 
         total_response_len = (model_inputs["labels"] != -100).sum().item()
 
         train_time = time.time()
+        total_loss = None
 
         for i in trange(
             0,
@@ -656,29 +692,45 @@ def main():
                 total_response_len=total_response_len,
                 TEMPERATURE=TEMPERATURE,
                 KL_COEFFICIENT=KL_COEFFICIENT,
-            )
+            )   
+            print("Loss")
+            print(loss)
+            print(loss.requires_grad)
+
+            total_loss = loss + (total_loss if isinstance(total_loss, torch.Tensor) else 0)
+            print("Total Loss")
+            print(total_loss)
+            print(total_loss.requires_grad)
 
             # Track metrics
-            metrics.setdefault("loss", []).append(loss.item())
-            grad_norm = policy_model.get_global_grad_norm()
-            if grad_norm is not None:
-                grad_norm = grad_norm.item()
-            metrics.setdefault("grad_norm", []).append(grad_norm)
-            for k, v in loss_metrics.items():
-                metrics.setdefault(k, []).append(v.item() if isinstance(v, torch.Tensor) else v)
+            # metrics.setdefault("loss", []).append(loss.item())
+            # grad_norm = policy_model.get_global_grad_norm()
+            # if grad_norm is not None:
+            #     grad_norm = grad_norm.item()
+            # metrics.setdefault("grad_norm", []).append(grad_norm)
+            # for k, v in loss_metrics.items():
+            #     metrics.setdefault(k, []).append(v.item() if isinstance(v, torch.Tensor) else v)
 
             # Backpropagation and optimization step
-            policy_model.backward(loss, scale_wrt_gas=False)
+            # policy_model.backward(loss, scale_wrt_gas=False)
 
             # Free memory
             del loss, loss_metrics
-            if policy_model.is_gradient_accumulation_boundary():
-                reference_model.module.cpu()
+            # if policy_model.is_gradient_accumulation_boundary():
+            #     reference_model.module.cpu()
 
-            policy_model.step()
+            # policy_model.step()
+
+        reference_model.cpu()
+        total_loss = total_loss / (EPISODES_PER_ITERATION / PER_DEVICE_BATCH_SIZE)
+        total_loss.backward()
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
         print(f"Time taken to train: {time.time() - train_time} seconds")
 
+    
         #########################################################
         # Update inference engine weights
         #########################################################
@@ -688,38 +740,40 @@ def main():
         time.sleep(1)
 
         inference_engine.wake_up()
-        load_model_into_vllm(policy_model, inference_engine)
+        merged_model = policy_model.merge_and_unload()
+        load_model_into_vllm(merged_model, inference_engine)
 
-        #########################################################
-        # Log metrics
-        #########################################################
 
-        train_metrics = {k: np.mean(v) for k, v in metrics.items() if None not in v}
-        train_metrics["learning_rate"] = policy_model.get_lr()[0]
-        logs = {
-            "iteration": iteration,
-            f"episodes/iter_{iteration:06d}": episode_table,
-            **{f"train/{k}": v for k, v in train_metrics.items()},
-        }
-        if eval_stats is not None:
-            logs.update({f"eval/{k}": np.mean(v) for k, v in eval_stats.items()})
-        wandb.log(logs)
+    #     #########################################################
+    #     # Log metrics
+    #     #########################################################
 
-        selected_keys = [
-            "train/kl_penalty",
-            "train/rewards",
-            "train/reward_metrics/format_reward",
-            "train/reward_metrics/equation_reward",
-            "eval/rewards",
-            "eval/reward_metrics/format_reward",
-            "eval/reward_metrics/equation_reward",
-        ]
-        selected_metrics = {k: logs[k] for k in selected_keys if k in logs}
-        print(f"KEY METRICS: {selected_metrics}")
+    #     train_metrics = {k: np.mean(v) for k, v in metrics.items() if None not in v}
+    #     train_metrics["learning_rate"] = policy_model.get_lr()[0]
+    #     logs = {
+    #         "iteration": iteration,
+    #         f"episodes/iter_{iteration:06d}": episode_table,
+    #         **{f"train/{k}": v for k, v in train_metrics.items()},
+    #     }
+    #     if eval_stats is not None:
+    #         logs.update({f"eval/{k}": np.mean(v) for k, v in eval_stats.items()})
+    #     wandb.log(logs)
 
-        if iteration % 50 == 0 and iteration != 0:
-            policy_model.module.save_pretrained(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "hf_model"))
-            policy_model.save_checkpoint(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "deepspeed"))
+    #     selected_keys = [
+    #         "train/kl_penalty",
+    #         "train/rewards",
+    #         "train/reward_metrics/format_reward",
+    #         "train/reward_metrics/equation_reward",
+    #         "eval/rewards",
+    #         "eval/reward_metrics/format_reward",
+    #         "eval/reward_metrics/equation_reward",
+    #     ]
+    #     selected_metrics = {k: logs[k] for k in selected_keys if k in logs}
+    #     print(f"KEY METRICS: {selected_metrics}")
+
+    #     if iteration % 50 == 0 and iteration != 0:
+    #         policy_model.module.save_pretrained(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "hf_model"))
+    #         policy_model.save_checkpoint(str(EXP_DIR / "checkpoints" / f"ckpt_{iteration:06d}" / "deepspeed"))
 
 
 if __name__ == "__main__":
